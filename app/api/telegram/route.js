@@ -8,44 +8,68 @@ export async function POST(req) {
   if (!body.message) return NextResponse.json({ ok: true });
 
   const chatId = body.message.chat.id;
-
-  // 🔐 Allow only your group
   if (String(chatId) !== process.env.ALLOWED_CHAT_ID) {
     return NextResponse.json({ ok: true });
   }
 
   const text = body.message.text;
   if (!text) {
-    await sendMessage(chatId, "❌ নিউজ লেখা পাঠান (text required)");
+    await sendMessage(chatId, "❌ নিউজ লেখা পাঠান");
     return NextResponse.json({ ok: true });
   }
 
+  const reporterName =
+    body.message.from.first_name +
+    (body.message.from.last_name ? " " + body.message.from.last_name : "");
+  const reporterId = String(body.message.from.id);
+
   try {
-    // 1️⃣ Gemini SEO
+    // 1️⃣ Rewrite + SEO
     const seo = await generateSEO(text);
 
-    // 2️⃣ WordPress Draft
+    // 2️⃣ Duplicate check
+    const isDuplicate = await checkDuplicate(seo.title);
+    if (isDuplicate) {
+      await sendMessage(chatId, "⚠️ এই নিউজ আগে পোস্ট হয়েছে");
+      return NextResponse.json({ ok: true });
+    }
+
+    // 3️⃣ Category detect
+    const categoryId = await detectCategory(seo.title + " " + seo.content);
+
+    // 4️⃣ Trusted reporter?
+    const trusted = process.env.TRUSTED_REPORTERS
+      ?.split(",")
+      .includes(reporterId);
+
+    // 5️⃣ Create post
     await createWPPost({
       title: seo.title,
-      content: text,
+      content: seo.content + `\n\nপ্রতিবেদন: ${reporterName}`,
       slug: seo.slug,
       excerpt: seo.excerpt,
-      tags: seo.tags,
       meta_title: seo.meta_title,
       meta_description: seo.meta_description,
+      meta_keywords: seo.meta_keywords,
+      status: trusted ? "publish" : "draft",
+      category: categoryId,
     });
 
-    await sendMessage(chatId, "✅ নিউজ WordPress-এ draft হিসেবে চলে গেছে");
-    } catch (e) {
+    await sendMessage(
+      chatId,
+      trusted
+        ? "✅ নিউজ সরাসরি প্রকাশ হয়েছে"
+        : "✅ নিউজ draft হিসেবে জমা হয়েছে"
+    );
+  } catch (e) {
     console.error(e);
     await sendMessage(chatId, "❌ ERROR:\n" + e.message);
   }
 
-
   return NextResponse.json({ ok: true });
 }
 
-// ---------------- HELPERS ----------------
+/* ---------------- HELPERS ---------------- */
 
 async function sendMessage(chatId, text) {
   await fetch(`${TELEGRAM_API}/sendMessage`, {
@@ -57,23 +81,30 @@ async function sendMessage(chatId, text) {
 
 async function generateSEO(newsText) {
   const prompt = `
-তুমি একজন বাংলা নিউজ পোর্টালের SEO এডিটর।
+তুমি একজন বাংলা নিউজ এডিটর ও SEO এক্সপার্ট।
 
-নিচের নিউজ থেকে STRICT JSON আকারে দাও:
+কাঁচা নিউজটি নতুনভাবে রিরাইট করো:
+- লেখা বড় করো
+- ভাষা প্রফেশনাল করো
+- plagiarism-safe রাখো
+
+শুধু নিচের JSON দাও:
+
 {
   "title": "",
+  "content": "",
   "meta_title": "",
   "meta_description": "",
+  "meta_keywords": [],
   "slug": "",
-  "tags": [],
   "excerpt": ""
 }
 
 Rules:
-- meta_title max 60 characters
-- meta_description max 160 characters
-- slug english-bangla mixed, hyphen-separated
-- tags 5-7
+- meta_title ≤ 60 chars
+- meta_description ≤ 160 chars
+- meta_keywords 5–7
+- slug ছোট, english-bangla mixed
 
 নিউজ:
 ${newsText}
@@ -83,26 +114,64 @@ ${newsText}
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
-      contents: [
-        {
-          parts: [{ text: prompt }],
-        },
-      ],
+      contents: [{ role: "user", parts: [{ text: prompt }] }],
+      generationConfig: { temperature: 0.3, maxOutputTokens: 900 },
     }),
   });
 
   const data = await res.json();
-  const textOutput = data.candidates[0].content.parts[0].text;
+  if (!data.candidates?.length) {
+    throw new Error("Gemini response empty");
+  }
 
-  return JSON.parse(textOutput);
+  return extractJSON(data.candidates[0].content.parts[0].text);
+}
+
+function extractJSON(text) {
+  const match = text.match(/\{[\s\S]*\}/);
+  if (!match) throw new Error("JSON parse failed");
+  return JSON.parse(match[0]);
+}
+
+async function checkDuplicate(title) {
+  const auth = getAuth();
+  const res = await fetch(
+    `${process.env.WP_SITE}/wp-json/wp/v2/posts?search=${encodeURIComponent(
+      title
+    )}&per_page=1`,
+    { headers: { Authorization: auth } }
+  );
+  const posts = await res.json();
+  return posts.length > 0;
+}
+
+async function detectCategory(text) {
+  const map = {
+    "crime": ["খুন", "মামলা", "গ্রেপ্তার", "পুলিশ"],
+    "sports": ["খেলা", "ম্যাচ", "গোল", "টুর্নামেন্ট"],
+    "politics": ["নির্বাচন", "মন্ত্রী", "সংসদ", "দল"],
+  };
+
+  for (const [slug, words] of Object.entries(map)) {
+    if (words.some((w) => text.includes(w))) {
+      return await getCategoryId(slug);
+    }
+  }
+  return await getCategoryId("news");
+}
+
+async function getCategoryId(slug) {
+  const auth = getAuth();
+  const res = await fetch(
+    `${process.env.WP_SITE}/wp-json/wp/v2/categories?slug=${slug}`,
+    { headers: { Authorization: auth } }
+  );
+  const data = await res.json();
+  return data[0]?.id || 1;
 }
 
 async function createWPPost(post) {
-  const auth =
-    "Basic " +
-    Buffer.from(
-      `${process.env.WP_USERNAME}:${process.env.WP_APP_PASSWORD}`
-    ).toString("base64");
+  const auth = getAuth();
 
   await fetch(`${process.env.WP_SITE}/wp-json/wp/v2/posts`, {
     method: "POST",
@@ -115,11 +184,22 @@ async function createWPPost(post) {
       content: post.content,
       slug: post.slug,
       excerpt: post.excerpt,
-      status: "draft",
+      status: post.status,
+      categories: [post.category],
       meta: {
         rank_math_title: post.meta_title,
         rank_math_description: post.meta_description,
+        rank_math_focus_keyword: post.meta_keywords.join(", "),
       },
     }),
   });
+}
+
+function getAuth() {
+  return (
+    "Basic " +
+    Buffer.from(
+      `${process.env.WP_USERNAME}:${process.env.WP_APP_PASSWORD}`
+    ).toString("base64")
+  );
 }
