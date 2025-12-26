@@ -36,9 +36,11 @@ export async function POST(req) {
     });
 
     await sendMessage(chatId, "✅ নিউজ WordPress-এ draft হিসেবে চলে গেছে");
-  } catch (e) {
-    await sendMessage(chatId, "❌ সমস্যা হয়েছে, পরে আবার চেষ্টা করুন");
+    } catch (e) {
+    console.error(e);
+    await sendMessage(chatId, "❌ ERROR:\n" + e.message);
   }
+
 
   return NextResponse.json({ ok: true });
 }
